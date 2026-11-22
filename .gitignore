@@ -1,0 +1,77 @@
+# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native
+.kotlin/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Metro
+.metro-health-check*
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# macOS
+.DS_Store
+*.pem
+
+# Environment values stay local; committed examples must contain placeholders only.
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# Local agent state, authentication caches, and validation worktrees
+.codex/
+.validation/
+.aws/
+.ssh/
+.azure/
+.config/gcloud/
+.wrangler/
+.firebase/
+
+# Private credential exports (not Firebase's public client configuration)
+credentials.json
+*service-account*.json
+*service_account*.json
+*serviceAccount*.json
+*firebase-adminsdk*.json
+*.pfx
+*.keystore
+id_rsa
+id_ecdsa
+id_ed25519
+
+# Local test exports, screenshots, and service debug logs
+/.impeccable/review/fidelity/
+/dist-*-check/
+/cubo-*-preview.png
+firebase-debug.log*
+firestore-debug.log*
+ui-debug.log*
+
+# typescript
+*.tsbuildinfo
+
+# generated native folders
+/ios
+/android
+# Private local family-server state and personal data
+.local-family/

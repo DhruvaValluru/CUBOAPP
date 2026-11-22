@@ -1,0 +1,612 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    // Collection: users
+    // Document ID: authenticated Firebase Auth UID
+    // Fields:
+    //   uid: string, required, immutable, 20-128 characters
+    //   name: string, required, 1-80 characters
+    //   email: string, required, immutable, 3-254 characters
+    //   theme: string, required, either "light" or "dark"
+    //   createdAt: timestamp, required, immutable, server time on create
+    //   updatedAt: timestamp, required, server time on every write
+    //   deletionRequestedAt: timestamp, optional, short-lived owner deletion marker
+    // The document contains private PII and is readable only by its owner.
+    //
+    // Collection: connectionCodes — short-lived exact-match invite code owned
+    // by one authenticated account; listing is denied.
+    // Collection: connectionRequests — bounded pending/approved relationship
+    // request, readable only by its owner and requester.
+    // Collection: connections — one Family/Friend relationship with bounded
+    // score and foreground location-snapshot fields for its two participants.
+    // Collection: familyMemberships — immutable organizer authority marker for
+    // every linked family member. The historical minorUid field is the member UID.
+    // Collection: birthDateChangeRequests — exact linked-member DOB/account-type
+    // request that only the organizer can approve and atomically apply.
+    // Collection: locationShareRequests — Family organizer request that only
+    // the linked minor may approve or deny; approval itself does not grant GPS.
+    // Collection: familyAppPolicies — organizer-managed Blocked Apps selection
+    // for one linked minor; Child Lock controls the minor's edit access.
+    // Collection: roadReports/confirmations — bounded, expiring road hazard
+    // reports and one response per authenticated account.
+    // ===============================================================
+
+    // Helper functions
+    function isAuthenticated() { return request.auth != null; }
+    function isOwner(userId) { return isAuthenticated() && request.auth.uid == userId; }
+    function uidUnchanged() { return isAuthenticated() && request.resource.data.uid == request.auth.uid; }
+    function uidNotModified() { return isAuthenticated() && request.resource.data.uid == resource.data.uid; }
+    function isValidEmail(email) { return email is string && email.size() >= 3 && email.size() <= 254 && email.matches('^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}$'); }
+    function isValidAvatarId(value) {
+      return value is string && value in ['masc-01', 'masc-02', 'masc-03', 'masc-04', 'masc-05', 'masc-06', 'fem-01', 'fem-02', 'fem-03', 'fem-04', 'fem-05', 'fem-06'];
+    }
+    // Self-declared metadata only: never grants family roles or age-verified access.
+    function validAccountDetails(data) {
+      return data is map
+        && data.keys().hasAll(['birthDate', 'phoneNumber', 'accountType', 'ageVerification', 'phoneVerification', 'guardianStatus'])
+        && data.keys().hasOnly(['birthDate', 'phoneNumber', 'accountType', 'ageVerification', 'phoneVerification', 'guardianStatus'])
+        && data.birthDate is string && data.birthDate.size() == 10
+        && data.birthDate.matches('^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$')
+        && data.phoneNumber is string
+        && (data.phoneNumber.size() == 0 || (data.phoneNumber.size() >= 9 && data.phoneNumber.size() <= 16
+          && data.phoneNumber.matches('^[+][1-9][0-9]{7,14}$')))
+        && data.accountType in ['minor', 'adult']
+        && data.ageVerification == 'self-declared'
+        && data.phoneVerification == 'unverified'
+        && data.guardianStatus == 'not-linked';
+    }
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'name', 'email', 'theme', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'name', 'email', 'theme', 'avatarId', 'createdAt', 'updatedAt', 'accountDetails', 'deletionRequestedAt'])
+        && data.uid is string && data.uid.size() >= 20 && data.uid.size() <= 128
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && isValidEmail(data.email)
+        && data.theme is string && data.theme in ['light', 'dark']
+        && (!('avatarId' in data) || isValidAvatarId(data.avatarId))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp
+        && (!('deletionRequestedAt' in data) || data.deletionRequestedAt is timestamp)
+        && (!('accountDetails' in data) || validAccountDetails(data.accountDetails));
+    }
+    function isValidSyncDocument(domain, data) {
+      return domain in ['vehicles', 'places', 'insurance', 'blockedApps', 'drives', 'assistant']
+        && data.keys().hasAll(['schemaVersion', 'payload', 'updatedAt'])
+        && data.keys().hasOnly(['schemaVersion', 'payload', 'updatedAt'])
+        && data.schemaVersion is int && data.schemaVersion == 1
+        && data.payload is string
+        && ((domain == 'vehicles' && data.payload.size() <= 60000)
+          || (domain == 'places' && data.payload.size() <= 80000)
+          || (domain == 'insurance' && data.payload.size() <= 20000)
+          || (domain == 'blockedApps' && data.payload.size() <= 120000)
+          || (domain == 'drives' && data.payload.size() <= 700000)
+          || (domain == 'assistant' && data.payload.size() <= 500000))
+        && data.updatedAt is timestamp && data.updatedAt == request.time;
+    }
+    function userDoc(userId) { return get(/databases/$(database)/documents/users/$(userId)).data; }
+    function accountDeletionRequested(userId) {
+      return isAuthenticated() && request.auth.uid == userId
+        && exists(/databases/$(database)/documents/users/$(userId))
+        && 'deletionRequestedAt' in userDoc(userId)
+        && userDoc(userId).deletionRequestedAt is timestamp
+        && userDoc(userId).deletionRequestedAt > request.time - duration.value(15, 'm')
+        && userDoc(userId).deletionRequestedAt <= request.time;
+    }
+    function isAdultAccount(userId) { return userDoc(userId).accountDetails.accountType == 'adult'; }
+    function familyMembership(userId) { return get(/databases/$(database)/documents/familyMemberships/$(userId)).data; }
+    // Firestore Rules cannot safely use JavaScript-style lexical ordering for
+    // Auth UID strings. Accept either of the two bounded pair orders instead;
+    // the app still emits one stable order and the reverse document is denied.
+    function orderedConnectionId(kind, firstUid, secondUid) {
+      return kind + '_' + firstUid + '_' + secondUid;
+    }
+    function isConnectionPairId(documentId, kind, firstUid, secondUid) {
+      return documentId == orderedConnectionId(kind, firstUid, secondUid)
+        || documentId == orderedConnectionId(kind, secondUid, firstUid);
+    }
+    function reverseConnectionId(documentId, kind, firstUid, secondUid) {
+      return documentId == orderedConnectionId(kind, firstUid, secondUid)
+        ? orderedConnectionId(kind, secondUid, firstUid)
+        : orderedConnectionId(kind, firstUid, secondUid);
+    }
+    function validConnectionCode(codeId, data) {
+      return data.keys().hasAll(['code', 'kind', 'ownerUid', 'ownerName', 'status', 'createdAt', 'expiresAt'])
+        && data.keys().hasOnly(['code', 'kind', 'ownerUid', 'ownerName', 'ownerAvatarId', 'status', 'createdAt', 'expiresAt'])
+        && data.code == codeId && data.code is string && data.code.size() == 11
+        && ((data.kind == 'family' && data.code.matches('^F-[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}-[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$'))
+          || (data.kind == 'friend' && data.code.matches('^R-[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}-[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$')))
+        && data.kind in ['family', 'friend']
+        && data.ownerUid is string && data.ownerUid.size() >= 20 && data.ownerUid.size() <= 128
+        && data.ownerName is string && data.ownerName.size() >= 1 && data.ownerName.size() <= 80
+        && (!('ownerAvatarId' in data) || isValidAvatarId(data.ownerAvatarId))
+        && data.status in ['active', 'closed']
+        && data.createdAt is timestamp && data.expiresAt is timestamp;
+    }
+    function validConnectionRequest(data) {
+      return data.keys().hasAll(['code', 'kind', 'ownerUid', 'ownerName', 'requesterUid', 'requesterName', 'requesterAccountType', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['code', 'kind', 'ownerUid', 'ownerName', 'ownerAvatarId', 'requesterUid', 'requesterName', 'requesterAvatarId', 'requesterAccountType', 'status', 'createdAt', 'updatedAt'])
+        && data.code is string && data.code.size() == 11
+        && ((data.kind == 'family' && data.code.matches('^F-[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}-[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$'))
+          || (data.kind == 'friend' && data.code.matches('^R-[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}-[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$')))
+        && data.kind in ['family', 'friend']
+        && data.ownerUid is string && data.ownerUid.size() >= 20 && data.ownerUid.size() <= 128
+        && data.requesterUid is string && data.requesterUid.size() >= 20 && data.requesterUid.size() <= 128
+        && data.ownerUid != data.requesterUid
+        && data.ownerName is string && data.ownerName.size() >= 1 && data.ownerName.size() <= 80
+        && data.requesterName is string && data.requesterName.size() >= 1 && data.requesterName.size() <= 80
+        && (!('ownerAvatarId' in data) || isValidAvatarId(data.ownerAvatarId))
+        && (!('requesterAvatarId' in data) || isValidAvatarId(data.requesterAvatarId))
+        && data.requesterAccountType in ['minor', 'adult']
+        && data.status in ['pending', 'approved', 'declined']
+        && data.createdAt is timestamp && data.updatedAt is timestamp;
+    }
+    function nullableScore(value) { return value == null || (value is int && value >= 0 && value <= 100); }
+    function nullableLatitude(value) { return value == null || ((value is int || value is float) && value >= -90 && value <= 90); }
+    function nullableLongitude(value) { return value == null || ((value is int || value is float) && value >= -180 && value <= 180); }
+    function nullableTimestamp(value) { return value == null || value is timestamp; }
+    function validConnection(data) {
+      return data.keys().hasAll(['kind', 'ownerUid', 'ownerName', 'memberUid', 'memberName', 'memberAccountType', 'ownerShareScore', 'ownerShareLocation', 'memberShareScore', 'memberShareLocation', 'ownerScore', 'memberScore', 'ownerLatitude', 'ownerLongitude', 'ownerLocationAt', 'memberLatitude', 'memberLongitude', 'memberLocationAt', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['requestId', 'kind', 'ownerUid', 'ownerName', 'ownerAvatarId', 'ownerAccountType', 'memberUid', 'memberName', 'memberAvatarId', 'memberAccountType', 'ownerShareScore', 'ownerShareLocation', 'memberShareScore', 'memberShareLocation', 'ownerScore', 'memberScore', 'ownerScoreMeasured', 'memberScoreMeasured', 'ownerLatitude', 'ownerLongitude', 'ownerLocationAt', 'memberLatitude', 'memberLongitude', 'memberLocationAt', 'createdAt', 'updatedAt'])
+        && (!('requestId' in data) || (data.requestId is string && data.requestId.size() >= 1 && data.requestId.size() <= 320))
+        && (!('ownerScoreMeasured' in data) || data.ownerScoreMeasured is bool)
+        && (!('memberScoreMeasured' in data) || data.memberScoreMeasured is bool)
+        && data.kind in ['family', 'friend']
+        && data.ownerUid is string && data.ownerUid.size() >= 20 && data.ownerUid.size() <= 128
+        && data.memberUid is string && data.memberUid.size() >= 20 && data.memberUid.size() <= 128
+        && data.ownerUid != data.memberUid
+        && data.ownerName is string && data.ownerName.size() >= 1 && data.ownerName.size() <= 80
+        && data.memberName is string && data.memberName.size() >= 1 && data.memberName.size() <= 80
+        && (!('ownerAvatarId' in data) || isValidAvatarId(data.ownerAvatarId))
+        && (!('ownerAccountType' in data) || data.ownerAccountType in ['minor', 'adult'])
+        && (!('memberAvatarId' in data) || isValidAvatarId(data.memberAvatarId))
+        && data.memberAccountType in ['minor', 'adult']
+        && data.ownerShareScore is bool && data.ownerShareLocation is bool
+        && data.memberShareScore is bool && data.memberShareLocation is bool
+        && nullableScore(data.ownerScore) && nullableScore(data.memberScore)
+        && nullableLatitude(data.ownerLatitude) && nullableLongitude(data.ownerLongitude) && nullableTimestamp(data.ownerLocationAt)
+        && nullableLatitude(data.memberLatitude) && nullableLongitude(data.memberLongitude) && nullableTimestamp(data.memberLocationAt)
+        && (data.ownerShareScore || (data.ownerScore == null && (!('ownerScoreMeasured' in data) || data.ownerScoreMeasured == false)))
+        && (data.memberShareScore || (data.memberScore == null && (!('memberScoreMeasured' in data) || data.memberScoreMeasured == false)))
+        && (data.ownerShareLocation || (data.ownerLatitude == null && data.ownerLongitude == null && data.ownerLocationAt == null))
+        && (data.memberShareLocation || (data.memberLatitude == null && data.memberLongitude == null && data.memberLocationAt == null))
+        && data.createdAt is timestamp && data.updatedAt is timestamp;
+    }
+    function validFamilyMembership(minorId, data) {
+      return data.keys().hasAll(['minorUid', 'organizerUid', 'connectionId', 'createdAt'])
+        && data.keys().hasOnly(['minorUid', 'organizerUid', 'connectionId', 'createdAt'])
+        && data.minorUid == minorId
+        && data.organizerUid is string && data.organizerUid.size() >= 20 && data.organizerUid.size() <= 128
+        && data.connectionId is string && data.connectionId.size() >= 1 && data.connectionId.size() <= 320
+        && data.createdAt is timestamp;
+    }
+    function validBirthDateChange(minorId, data) {
+      return data.keys().hasAll(['connectionId', 'organizerUid', 'organizerName', 'minorUid', 'minorName', 'previousBirthDate', 'requestedBirthDate', 'requestedAccountType', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['connectionId', 'organizerUid', 'organizerName', 'minorUid', 'minorName', 'previousBirthDate', 'requestedBirthDate', 'requestedAccountType', 'status', 'createdAt', 'updatedAt'])
+        && data.minorUid == minorId
+        && data.organizerUid is string && data.organizerUid.size() >= 20 && data.organizerUid.size() <= 128
+        && data.organizerName is string && data.organizerName.size() >= 1 && data.organizerName.size() <= 80
+        && data.minorName is string && data.minorName.size() >= 1 && data.minorName.size() <= 80
+        && data.connectionId is string && data.connectionId.size() >= 1 && data.connectionId.size() <= 320
+        && data.previousBirthDate is string && data.previousBirthDate.matches('^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$')
+        && data.requestedBirthDate is string && data.requestedBirthDate.matches('^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$')
+        && data.requestedAccountType in ['minor', 'adult']
+        && data.status in ['pending', 'approved', 'denied']
+        && data.createdAt is timestamp && data.updatedAt is timestamp;
+    }
+    function validLocationShareRequest(connectionId, data) {
+      return data.keys().hasAll(['connectionId', 'organizerUid', 'organizerName', 'minorUid', 'minorName', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['connectionId', 'organizerUid', 'organizerName', 'minorUid', 'minorName', 'status', 'createdAt', 'updatedAt'])
+        && data.connectionId == connectionId
+        && data.organizerUid is string && data.organizerUid.size() >= 20 && data.organizerUid.size() <= 128
+        && data.organizerName is string && data.organizerName.size() >= 1 && data.organizerName.size() <= 80
+        && data.minorUid is string && data.minorUid.size() >= 20 && data.minorUid.size() <= 128
+        && data.minorName is string && data.minorName.size() >= 1 && data.minorName.size() <= 80
+        && data.organizerUid != data.minorUid
+        && data.status in ['pending', 'approved', 'denied']
+        && data.createdAt is timestamp && data.updatedAt is timestamp;
+    }
+    function validFamilyAppPolicy(minorId, data) {
+      return data.keys().hasAll(['minorUid', 'organizerUid', 'connectionId', 'targetName', 'enabled', 'lockedByParent', 'selectedIds', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['minorUid', 'organizerUid', 'connectionId', 'targetName', 'enabled', 'lockedByParent', 'selectedIds', 'createdAt', 'updatedAt'])
+        && data.minorUid == minorId
+        && data.organizerUid is string && data.organizerUid.size() >= 20 && data.organizerUid.size() <= 128
+        && data.connectionId is string && data.connectionId.size() >= 1 && data.connectionId.size() <= 320
+        && data.targetName is string && data.targetName.size() >= 1 && data.targetName.size() <= 60
+        && data.enabled is bool && data.lockedByParent is bool
+        && data.selectedIds is list && data.selectedIds.size() <= 12
+        && data.selectedIds.toSet().size() == data.selectedIds.size()
+        && data.selectedIds.toSet().hasOnly(['tiktok', 'instagram', 'facebook', 'snapchat', 'messages', 'facetime', 'whatsapp', 'telegram', 'youtube', 'spotify', 'uber', 'doordash'])
+        && data.createdAt is timestamp && data.updatedAt is timestamp;
+    }
+    function validRoadReport(data) {
+      return data.keys().hasAll(['reporterId', 'kind', 'latitude', 'longitude', 'cell', 'createdAt', 'confirmationCount', 'active'])
+        && data.keys().hasOnly(['reporterId', 'kind', 'latitude', 'longitude', 'cell', 'createdAt', 'confirmationCount', 'active'])
+        && data.reporterId is string && data.reporterId.size() >= 20 && data.reporterId.size() <= 128
+        && data.kind in ['object', 'police', 'crash']
+        && data.latitude is number && data.latitude >= -90 && data.latitude <= 90
+        && data.longitude is number && data.longitude >= -180 && data.longitude <= 180
+        && data.cell is string && data.cell.size() >= 3 && data.cell.size() <= 24
+        && data.cell == string(math.floor(data.latitude * 100)) + ':' + string(math.floor(data.longitude * 100))
+        && data.createdAt is timestamp
+        && data.confirmationCount is int && data.confirmationCount >= 0 && data.confirmationCount <= 10
+        && data.active is bool && data.active == (data.confirmationCount < 10);
+    }
+    function validRoadConfirmation(data) {
+      return data.keys().hasAll(['voterId', 'present', 'updatedAt'])
+        && data.keys().hasOnly(['voterId', 'present', 'updatedAt'])
+        && data.voterId is string && data.voterId.size() >= 20 && data.voterId.size() <= 128
+        && data.present is bool && data.updatedAt is timestamp;
+    }
+    function isActiveFamilyConnection(connectionId, organizerUid, memberUid) {
+      return exists(/databases/$(database)/documents/connections/$(connectionId))
+        && get(/databases/$(database)/documents/connections/$(connectionId)).data.kind == 'family'
+        && get(/databases/$(database)/documents/connections/$(connectionId)).data.ownerUid == organizerUid
+        && get(/databases/$(database)/documents/connections/$(connectionId)).data.memberUid == memberUid
+        && isAdultAccount(organizerUid);
+    }
+    function isActiveMinorFamily(connectionId, organizerUid, minorUid) {
+      return isActiveFamilyConnection(connectionId, organizerUid, minorUid)
+        && get(/databases/$(database)/documents/connections/$(connectionId)).data.memberAccountType == 'minor';
+    }
+
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId) && uidUnchanged() && isValidUser(request.resource.data)
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time;
+      allow update: if (isOwner(userId) && uidNotModified() && isValidUser(request.resource.data)
+          && request.resource.data.email == request.auth.token.email
+          && (request.resource.data.email == resource.data.email || request.auth.token.email_verified == true)
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.updatedAt == request.time
+          && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['deletionRequestedAt'])
+            || request.resource.data.deletionRequestedAt == request.time)
+          && (!exists(/databases/$(database)/documents/familyMemberships/$(userId))
+            || request.resource.data.accountDetails.birthDate == resource.data.accountDetails.birthDate
+              && request.resource.data.accountDetails.accountType == resource.data.accountDetails.accountType))
+        || (isAuthenticated()
+          && exists(/databases/$(database)/documents/birthDateChangeRequests/$(userId))
+          && get(/databases/$(database)/documents/birthDateChangeRequests/$(userId)).data.organizerUid == request.auth.uid
+          && isActiveFamilyConnection(get(/databases/$(database)/documents/birthDateChangeRequests/$(userId)).data.connectionId, request.auth.uid, userId)
+          && uidNotModified() && isValidUser(request.resource.data)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['accountDetails', 'updatedAt'])
+          && request.resource.data.accountDetails.diff(resource.data.accountDetails).affectedKeys().hasOnly(['birthDate', 'accountType'])
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.email == resource.data.email
+          && request.resource.data.updatedAt == request.time
+          && getAfter(/databases/$(database)/documents/birthDateChangeRequests/$(userId)).data.status == 'approved'
+          && getAfter(/databases/$(database)/documents/birthDateChangeRequests/$(userId)).data.organizerUid == request.auth.uid
+          && getAfter(/databases/$(database)/documents/birthDateChangeRequests/$(userId)).data.requestedBirthDate == request.resource.data.accountDetails.birthDate
+          && getAfter(/databases/$(database)/documents/birthDateChangeRequests/$(userId)).data.requestedAccountType == request.resource.data.accountDetails.accountType
+          && getAfter(/databases/$(database)/documents/familyMemberships/$(userId)).data.organizerUid == request.auth.uid
+          && getAfter(/databases/$(database)/documents/familyMemberships/$(userId)).data.connectionId
+            == get(/databases/$(database)/documents/birthDateChangeRequests/$(userId)).data.connectionId);
+      allow delete: if isOwner(userId) && accountDeletionRequested(userId);
+
+      // Bounded JSON envelopes keep account sync inexpensive and make it
+      // impossible for one signed-in account to read or overwrite another.
+      match /sync/{domain} {
+        allow read: if isOwner(userId);
+        allow create, update: if isOwner(userId) && isValidSyncDocument(domain, request.resource.data);
+        allow delete: if isOwner(userId) && accountDeletionRequested(userId);
+      }
+    }
+
+    // Short-lived exact-match codes. Only an owner-filtered cleanup query may
+    // list codes; knowing a code never grants access because the organizer
+    // still has to approve a request.
+    match /connectionCodes/{codeId} {
+      allow get: if isAuthenticated();
+      allow list: if isAuthenticated() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isAuthenticated()
+        && validConnectionCode(codeId, request.resource.data)
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.ownerName == userDoc(request.auth.uid).name
+        && request.resource.data.status == 'active'
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.expiresAt > request.time
+        && request.resource.data.expiresAt <= request.time + duration.value(20, 'm')
+        && (request.resource.data.kind == 'friend' || userDoc(request.auth.uid).accountDetails.accountType == 'adult');
+      allow update: if isAuthenticated() && resource.data.ownerUid == request.auth.uid
+        && validConnectionCode(codeId, request.resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+        && resource.data.status == 'active' && request.resource.data.status == 'closed';
+      allow delete: if isAuthenticated() && resource.data.ownerUid == request.auth.uid;
+    }
+
+    match /connectionRequests/{requestId} {
+      allow get, list: if isAuthenticated() && (resource.data.ownerUid == request.auth.uid || resource.data.requesterUid == request.auth.uid);
+      allow create: if isAuthenticated() && validConnectionRequest(request.resource.data)
+        && isConnectionPairId(requestId, request.resource.data.kind, request.resource.data.ownerUid, request.resource.data.requesterUid)
+        && !exists(/databases/$(database)/documents/connectionRequests/$(reverseConnectionId(requestId, request.resource.data.kind, request.resource.data.ownerUid, request.resource.data.requesterUid)))
+        && !exists(/databases/$(database)/documents/connections/$(requestId))
+        && !exists(/databases/$(database)/documents/connections/$(reverseConnectionId(requestId, request.resource.data.kind, request.resource.data.ownerUid, request.resource.data.requesterUid)))
+        && request.resource.data.requesterUid == request.auth.uid
+        && request.resource.data.requesterName == userDoc(request.auth.uid).name
+        && request.resource.data.requesterAccountType == userDoc(request.auth.uid).accountDetails.accountType
+        && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt == request.time && request.resource.data.updatedAt == request.time
+        && get(/databases/$(database)/documents/connectionCodes/$(request.resource.data.code)).data.status == 'active'
+        && get(/databases/$(database)/documents/connectionCodes/$(request.resource.data.code)).data.expiresAt > request.time
+        && get(/databases/$(database)/documents/connectionCodes/$(request.resource.data.code)).data.kind == request.resource.data.kind
+        && get(/databases/$(database)/documents/connectionCodes/$(request.resource.data.code)).data.ownerUid == request.resource.data.ownerUid
+        && get(/databases/$(database)/documents/connectionCodes/$(request.resource.data.code)).data.ownerName == request.resource.data.ownerName;
+      allow update: if isAuthenticated() && validConnectionRequest(request.resource.data)
+        && isConnectionPairId(requestId, request.resource.data.kind, request.resource.data.ownerUid, request.resource.data.requesterUid)
+        && request.resource.data.updatedAt == request.time
+        && ((resource.data.ownerUid == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+            && resource.data.status == 'pending' && request.resource.data.status == 'approved'
+            && (resource.data.kind != 'family' || isAdultAccount(request.auth.uid))
+            && getAfter(/databases/$(database)/documents/connections/$(requestId)).data.ownerUid == request.auth.uid)
+          || (resource.data.requesterUid == request.auth.uid
+            && resource.data.status == 'pending' && request.resource.data.status == 'pending'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['requesterAccountType', 'updatedAt'])
+            && request.resource.data.requesterAccountType == userDoc(request.auth.uid).accountDetails.accountType)
+          || (request.resource.data.requesterUid == request.auth.uid
+            && resource.data.status == 'declined' && request.resource.data.status == 'pending'
+            && request.resource.data.createdAt == request.time
+            && request.resource.data.requesterName == userDoc(request.auth.uid).name
+            && request.resource.data.requesterAccountType == userDoc(request.auth.uid).accountDetails.accountType
+            && ((resource.data.ownerUid == request.resource.data.ownerUid && resource.data.requesterUid == request.resource.data.requesterUid)
+              || (resource.data.ownerUid == request.resource.data.requesterUid && resource.data.requesterUid == request.resource.data.ownerUid))
+            && get(/databases/$(database)/documents/connectionCodes/$(request.resource.data.code)).data.status == 'active'
+            && get(/databases/$(database)/documents/connectionCodes/$(request.resource.data.code)).data.expiresAt > request.time
+            && get(/databases/$(database)/documents/connectionCodes/$(request.resource.data.code)).data.kind == request.resource.data.kind
+            && get(/databases/$(database)/documents/connectionCodes/$(request.resource.data.code)).data.ownerUid == request.resource.data.ownerUid
+            && get(/databases/$(database)/documents/connectionCodes/$(request.resource.data.code)).data.ownerName == request.resource.data.ownerName));
+      allow delete: if isAuthenticated()
+        && ((resource.data.ownerUid == request.auth.uid && resource.data.status == 'pending')
+          || (resource.data.status == 'approved'
+            && (resource.data.ownerUid == request.auth.uid || resource.data.requesterUid == request.auth.uid)
+            && !existsAfter(/databases/$(database)/documents/connections/$(requestId)))
+          || ((resource.data.ownerUid == request.auth.uid || resource.data.requesterUid == request.auth.uid)
+            && accountDeletionRequested(request.auth.uid)));
+    }
+
+    match /familyMemberships/{minorId} {
+      allow get, list: if isAuthenticated() && (resource.data.minorUid == request.auth.uid || resource.data.organizerUid == request.auth.uid);
+      allow create: if isAuthenticated() && validFamilyMembership(minorId, request.resource.data)
+        && (request.resource.data.minorUid == request.auth.uid || request.resource.data.organizerUid == request.auth.uid)
+        && isAdultAccount(request.resource.data.organizerUid)
+        && getAfter(/databases/$(database)/documents/connections/$(request.resource.data.connectionId)).data.kind == 'family'
+        && getAfter(/databases/$(database)/documents/connections/$(request.resource.data.connectionId)).data.ownerUid == request.resource.data.organizerUid
+        && getAfter(/databases/$(database)/documents/connections/$(request.resource.data.connectionId)).data.memberUid == request.resource.data.minorUid;
+      allow update: if false;
+      allow delete: if isAuthenticated() && (resource.data.minorUid == request.auth.uid || resource.data.organizerUid == request.auth.uid)
+        && (!existsAfter(/databases/$(database)/documents/connections/$(resource.data.connectionId))
+          || accountDeletionRequested(request.auth.uid));
+    }
+
+    match /birthDateChangeRequests/{minorId} {
+      allow get, list: if isAuthenticated() && (resource.data.minorUid == request.auth.uid || resource.data.organizerUid == request.auth.uid);
+      allow create: if isAuthenticated() && request.auth.uid == minorId
+        && validBirthDateChange(minorId, request.resource.data)
+        && request.resource.data.status == 'pending'
+        && request.resource.data.previousBirthDate == userDoc(minorId).accountDetails.birthDate
+        && request.resource.data.minorName == userDoc(minorId).name
+        && isActiveFamilyConnection(request.resource.data.connectionId, request.resource.data.organizerUid, minorId)
+        && get(/databases/$(database)/documents/connections/$(request.resource.data.connectionId)).data.ownerName == request.resource.data.organizerName
+        && get(/databases/$(database)/documents/connections/$(request.resource.data.connectionId)).data.memberName == request.resource.data.minorName
+        && request.resource.data.createdAt == request.time && request.resource.data.updatedAt == request.time;
+      allow update: if isAuthenticated() && validBirthDateChange(minorId, request.resource.data)
+        && ((request.auth.uid == minorId && resource.data.status == 'pending'
+            && request.resource.data.status == 'pending'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['requestedBirthDate', 'requestedAccountType', 'updatedAt'])
+            && request.resource.data.createdAt == resource.data.createdAt
+            && request.resource.data.previousBirthDate == userDoc(minorId).accountDetails.birthDate
+            && isActiveMinorFamily(resource.data.connectionId, resource.data.organizerUid, minorId)
+            && request.resource.data.updatedAt == request.time)
+          || (request.auth.uid == minorId && resource.data.status != 'pending'
+            && request.resource.data.status == 'pending'
+            && request.resource.data.previousBirthDate == userDoc(minorId).accountDetails.birthDate
+            && request.resource.data.minorName == userDoc(minorId).name
+            && isActiveFamilyConnection(request.resource.data.connectionId, request.resource.data.organizerUid, minorId)
+            && get(/databases/$(database)/documents/connections/$(request.resource.data.connectionId)).data.ownerName == request.resource.data.organizerName
+            && request.resource.data.createdAt == request.time && request.resource.data.updatedAt == request.time)
+          || (request.auth.uid == resource.data.organizerUid
+            && isAdultAccount(request.auth.uid)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+            && resource.data.status == 'pending' && request.resource.data.status in ['approved', 'denied']
+            && request.resource.data.updatedAt == request.time
+            && (request.resource.data.status == 'denied'
+              || (getAfter(/databases/$(database)/documents/users/$(minorId)).data.accountDetails.birthDate == resource.data.requestedBirthDate
+                && getAfter(/databases/$(database)/documents/users/$(minorId)).data.accountDetails.accountType == resource.data.requestedAccountType
+                && getAfter(/databases/$(database)/documents/connections/$(resource.data.connectionId)).data.memberAccountType == resource.data.requestedAccountType))));
+      allow delete: if isAuthenticated() && (request.auth.uid == minorId
+        || (resource.data.organizerUid == request.auth.uid
+          && !existsAfter(/databases/$(database)/documents/connections/$(resource.data.connectionId)))
+          || ((resource.data.organizerUid == request.auth.uid || resource.data.minorUid == request.auth.uid)
+            && accountDeletionRequested(request.auth.uid)));
+    }
+
+    // A request never grants location access. The linked minor must explicitly
+    // approve it in the app, which separately requests foreground OS consent.
+    match /locationShareRequests/{connectionId} {
+      // Participant-scoped listeners must be able to receive and dismiss an
+      // older request after its Family link changes. Writes remain bound to the
+      // active adult-organizer/minor relationship below.
+      allow list: if isAuthenticated()
+        && (resource.data.organizerUid == request.auth.uid || resource.data.minorUid == request.auth.uid);
+      allow get: if isAuthenticated()
+        && (resource.data.organizerUid == request.auth.uid || resource.data.minorUid == request.auth.uid)
+        && isActiveMinorFamily(connectionId, resource.data.organizerUid, resource.data.minorUid);
+      allow create: if isAuthenticated() && validLocationShareRequest(connectionId, request.resource.data)
+        && request.resource.data.organizerUid == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt == request.time && request.resource.data.updatedAt == request.time
+        && isActiveMinorFamily(connectionId, request.resource.data.organizerUid, request.resource.data.minorUid)
+        && request.resource.data.organizerName == get(/databases/$(database)/documents/connections/$(connectionId)).data.ownerName
+        && request.resource.data.minorName == get(/databases/$(database)/documents/connections/$(connectionId)).data.memberName;
+      allow update: if isAuthenticated() && validLocationShareRequest(connectionId, request.resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.updatedAt == request.time
+        && isActiveMinorFamily(connectionId, resource.data.organizerUid, resource.data.minorUid)
+        && ((request.auth.uid == resource.data.organizerUid
+            && resource.data.status in ['approved', 'denied'] && request.resource.data.status == 'pending')
+          || (request.auth.uid == resource.data.minorUid
+            && resource.data.status == 'pending' && request.resource.data.status in ['approved', 'denied']));
+      allow delete: if isAuthenticated()
+        && (resource.data.organizerUid == request.auth.uid || resource.data.minorUid == request.auth.uid)
+        && (!existsAfter(/databases/$(database)/documents/connections/$(connectionId))
+          || accountDeletionRequested(request.auth.uid));
+    }
+
+    // Parent-selected Blocked Apps synchronize to the linked minor. Child Lock
+    // is organizer-only; an unlocked minor may adjust only the app list/switch.
+    match /familyAppPolicies/{minorId} {
+      // Filtered collection listeners can prove participant ownership from
+      // organizerUid/minorUid, but cannot prove a linked-document exists for
+      // every potential query result. Writes retain the active-family check.
+      allow list: if isAuthenticated()
+        && (resource.data.organizerUid == request.auth.uid || resource.data.minorUid == request.auth.uid);
+      allow get: if isAuthenticated()
+        && (resource.data.organizerUid == request.auth.uid || resource.data.minorUid == request.auth.uid)
+        && isActiveMinorFamily(resource.data.connectionId, resource.data.organizerUid, resource.data.minorUid);
+      allow create: if isAuthenticated() && validFamilyAppPolicy(minorId, request.resource.data)
+        && request.resource.data.organizerUid == request.auth.uid
+        && request.resource.data.createdAt == request.time && request.resource.data.updatedAt == request.time
+        && isActiveMinorFamily(request.resource.data.connectionId, request.resource.data.organizerUid, request.resource.data.minorUid)
+        && request.resource.data.targetName == get(/databases/$(database)/documents/connections/$(request.resource.data.connectionId)).data.memberName;
+      allow update: if isAuthenticated() && validFamilyAppPolicy(minorId, request.resource.data)
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.updatedAt == request.time
+        && isActiveMinorFamily(resource.data.connectionId, resource.data.organizerUid, resource.data.minorUid)
+        && request.resource.data.targetName == get(/databases/$(database)/documents/connections/$(resource.data.connectionId)).data.memberName
+        && ((request.auth.uid == resource.data.organizerUid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['targetName', 'enabled', 'lockedByParent', 'selectedIds', 'updatedAt']))
+          || (request.auth.uid == resource.data.minorUid && resource.data.lockedByParent == false
+            && request.resource.data.lockedByParent == false
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['enabled', 'selectedIds', 'updatedAt'])));
+      allow delete: if isAuthenticated()
+        && (resource.data.organizerUid == request.auth.uid
+          || (resource.data.minorUid == request.auth.uid
+            && (!existsAfter(/databases/$(database)/documents/connections/$(resource.data.connectionId))
+              || isAdultAccount(request.auth.uid)))
+          || ((resource.data.organizerUid == request.auth.uid || resource.data.minorUid == request.auth.uid)
+            && accountDeletionRequested(request.auth.uid)));
+    }
+
+    match /connections/{connectionId} {
+      allow get, list: if isAuthenticated() && (resource.data.ownerUid == request.auth.uid || resource.data.memberUid == request.auth.uid);
+      allow create: if isAuthenticated() && validConnection(request.resource.data)
+        && connectionId == request.resource.data.requestId
+        && isConnectionPairId(connectionId, request.resource.data.kind, request.resource.data.ownerUid, request.resource.data.memberUid)
+        && !exists(/databases/$(database)/documents/connections/$(reverseConnectionId(connectionId, request.resource.data.kind, request.resource.data.ownerUid, request.resource.data.memberUid)))
+        && request.resource.data.requestId is string
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.ownerName == userDoc(request.auth.uid).name
+        && (!('ownerAccountType' in request.resource.data) || request.resource.data.ownerAccountType == userDoc(request.auth.uid).accountDetails.accountType)
+        && (request.resource.data.kind != 'family' || isAdultAccount(request.auth.uid))
+        && request.resource.data.createdAt == request.time && request.resource.data.updatedAt == request.time
+        && request.resource.data.ownerShareScore == false && request.resource.data.ownerShareLocation == false
+        && request.resource.data.memberShareLocation == false
+        && ((request.resource.data.kind == 'family' && request.resource.data.memberAccountType == 'minor'
+            && request.resource.data.memberShareScore == true && request.resource.data.memberScore == 100
+            && request.resource.data.memberScoreMeasured == false)
+          || ((request.resource.data.kind != 'family' || request.resource.data.memberAccountType != 'minor')
+            && request.resource.data.memberShareScore == false && request.resource.data.memberScore == null
+            && request.resource.data.memberScoreMeasured == false))
+        && getAfter(/databases/$(database)/documents/connectionRequests/$(request.resource.data.requestId)).data.status == 'approved'
+        && getAfter(/databases/$(database)/documents/connectionRequests/$(request.resource.data.requestId)).data.ownerUid == request.resource.data.ownerUid
+        && getAfter(/databases/$(database)/documents/connectionRequests/$(request.resource.data.requestId)).data.requesterUid == request.resource.data.memberUid
+        && getAfter(/databases/$(database)/documents/connectionRequests/$(request.resource.data.requestId)).data.kind == request.resource.data.kind
+        && getAfter(/databases/$(database)/documents/connectionRequests/$(request.resource.data.requestId)).data.requesterName == request.resource.data.memberName
+        && getAfter(/databases/$(database)/documents/connectionRequests/$(request.resource.data.requestId)).data.requesterAccountType == request.resource.data.memberAccountType
+        && (!('requesterAvatarId' in getAfter(/databases/$(database)/documents/connectionRequests/$(request.resource.data.requestId)).data)
+          || request.resource.data.memberAvatarId == getAfter(/databases/$(database)/documents/connectionRequests/$(request.resource.data.requestId)).data.requesterAvatarId)
+        && (request.resource.data.kind != 'family'
+          || (getAfter(/databases/$(database)/documents/familyMemberships/$(request.resource.data.memberUid)).data.organizerUid == request.resource.data.ownerUid
+            && getAfter(/databases/$(database)/documents/familyMemberships/$(request.resource.data.memberUid)).data.connectionId == connectionId));
+      allow update: if isAuthenticated() && validConnection(request.resource.data)
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.updatedAt == request.time
+        && ((resource.data.ownerUid == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['ownerShareScore', 'ownerShareLocation', 'ownerScore', 'ownerScoreMeasured', 'ownerLatitude', 'ownerLongitude', 'ownerLocationAt', 'updatedAt']))
+          || (resource.data.memberUid == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberShareScore', 'memberShareLocation', 'memberScore', 'memberScoreMeasured', 'memberLatitude', 'memberLongitude', 'memberLocationAt', 'updatedAt'])
+            && (resource.data.kind != 'family' || resource.data.memberAccountType != 'minor' || request.resource.data.memberShareScore == true))
+          || (resource.data.ownerUid == request.auth.uid && resource.data.kind == 'family'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberAccountType', 'updatedAt'])
+            && getAfter(/databases/$(database)/documents/birthDateChangeRequests/$(resource.data.memberUid)).data.status == 'approved'
+            && getAfter(/databases/$(database)/documents/birthDateChangeRequests/$(resource.data.memberUid)).data.requestedAccountType == request.resource.data.memberAccountType)
+          || (resource.data.ownerUid == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['ownerName', 'ownerAvatarId', 'updatedAt'])
+            && request.resource.data.ownerName == getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.name
+            && request.resource.data.ownerAvatarId == getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.avatarId)
+          || (resource.data.ownerUid == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['ownerAccountType', 'updatedAt'])
+            && request.resource.data.ownerAccountType == userDoc(request.auth.uid).accountDetails.accountType
+            && (resource.data.kind != 'family' || request.resource.data.ownerAccountType == 'adult'))
+          || (resource.data.memberUid == request.auth.uid && resource.data.kind == 'friend'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberAccountType', 'updatedAt'])
+            && request.resource.data.memberAccountType == userDoc(request.auth.uid).accountDetails.accountType)
+          || (resource.data.memberUid == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberName', 'memberAvatarId', 'updatedAt'])
+            && request.resource.data.memberName == getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.name
+            && request.resource.data.memberAvatarId == getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.avatarId)
+          || (resource.data.ownerUid == request.auth.uid && accountDeletionRequested(request.auth.uid)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['ownerName', 'ownerShareScore', 'ownerShareLocation', 'ownerScore', 'ownerScoreMeasured', 'ownerLatitude', 'ownerLongitude', 'ownerLocationAt', 'updatedAt'])
+            && request.resource.data.ownerName == 'Account Terminated'
+            && request.resource.data.ownerShareScore == false && request.resource.data.ownerShareLocation == false
+            && request.resource.data.ownerScore == null && request.resource.data.ownerScoreMeasured == false
+            && request.resource.data.ownerLatitude == null && request.resource.data.ownerLongitude == null && request.resource.data.ownerLocationAt == null)
+          || (resource.data.memberUid == request.auth.uid && accountDeletionRequested(request.auth.uid)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberName', 'memberShareScore', 'memberShareLocation', 'memberScore', 'memberScoreMeasured', 'memberLatitude', 'memberLongitude', 'memberLocationAt', 'updatedAt'])
+            && request.resource.data.memberName == 'Account Terminated'
+            && request.resource.data.memberShareScore == false && request.resource.data.memberShareLocation == false
+            && request.resource.data.memberScore == null && request.resource.data.memberScoreMeasured == false
+            && request.resource.data.memberLatitude == null && request.resource.data.memberLongitude == null && request.resource.data.memberLocationAt == null));
+      allow delete: if isAuthenticated() && (resource.data.ownerUid == request.auth.uid || resource.data.memberUid == request.auth.uid)
+        && (resource.data.kind != 'family'
+          || !existsAfter(/databases/$(database)/documents/familyMemberships/$(resource.data.memberUid)));
+    }
+
+    // Community road reports are shared with any authenticated CUBO driver,
+    // independent of Family/Friends. They contain no names, routes, or profile
+    // data, expire from client queries after 30 minutes, and cannot be edited by
+    // their submitter. A response and its counter increment must commit together.
+    match /roadReports/{reportId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && validRoadReport(request.resource.data)
+        && request.resource.data.reporterId == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.confirmationCount == 0 && request.resource.data.active == true;
+      allow update: if isAuthenticated() && validRoadReport(request.resource.data)
+        && resource.data.reporterId != request.auth.uid && resource.data.active == true
+        && resource.data.createdAt + duration.value(30, 'm') > request.time
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['confirmationCount', 'active'])
+        && request.resource.data.confirmationCount == resource.data.confirmationCount + 1
+        && !exists(/databases/$(database)/documents/roadReports/$(reportId)/confirmations/$(request.auth.uid))
+        && validRoadConfirmation(getAfter(/databases/$(database)/documents/roadReports/$(reportId)/confirmations/$(request.auth.uid)).data)
+        && getAfter(/databases/$(database)/documents/roadReports/$(reportId)/confirmations/$(request.auth.uid)).data.voterId == request.auth.uid
+        && getAfter(/databases/$(database)/documents/roadReports/$(reportId)/confirmations/$(request.auth.uid)).data.updatedAt == request.time;
+      allow delete: if isAuthenticated() && resource.data.reporterId == request.auth.uid
+        && accountDeletionRequested(request.auth.uid);
+
+      match /confirmations/{voterId} {
+        allow read: if isAuthenticated() && resource.data.voterId == request.auth.uid;
+        allow create: if isAuthenticated() && voterId == request.auth.uid
+          && exists(/databases/$(database)/documents/roadReports/$(reportId))
+          && get(/databases/$(database)/documents/roadReports/$(reportId)).data.reporterId != request.auth.uid
+          && get(/databases/$(database)/documents/roadReports/$(reportId)).data.active == true
+          && get(/databases/$(database)/documents/roadReports/$(reportId)).data.createdAt + duration.value(30, 'm') > request.time
+          && validRoadConfirmation(request.resource.data)
+          && request.resource.data.voterId == request.auth.uid && request.resource.data.updatedAt == request.time
+          && validRoadReport(getAfter(/databases/$(database)/documents/roadReports/$(reportId)).data)
+          && getAfter(/databases/$(database)/documents/roadReports/$(reportId)).data.confirmationCount
+            == get(/databases/$(database)/documents/roadReports/$(reportId)).data.confirmationCount + 1;
+        allow update: if false;
+        allow delete: if isAuthenticated() && voterId == request.auth.uid
+          && resource.data.voterId == request.auth.uid
+          && accountDeletionRequested(request.auth.uid);
+      }
+    }
+
+    match /{document=**} { allow read, write: if false; }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "roadReports",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "cell", "order": "ASCENDING" },
+        { "fieldPath": "createdAt", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": [
+    {
+      "collectionGroup": "confirmations",
+      "fieldPath": "voterId",
+      "indexes": [
+        { "order": "ASCENDING", "queryScope": "COLLECTION_GROUP" }
+      ]
+    }
+  ]
+}

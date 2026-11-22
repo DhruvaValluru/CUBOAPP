@@ -1,0 +1,24 @@
+{
+  "score": 2,
+  "summary": "Release rules are schema-bounded, authenticated, atomic, published successfully, and paired with an enabled production index. A two-phone physical-drive test remains recommended.",
+  "findings": [
+    {
+      "check": "Business Logic vs. Rules",
+      "severity": "moderate",
+      "issue": "Firebase accepted the published rules and the required index is enabled; cross-device visibility has not yet been exercised during a real two-phone drive.",
+      "recommendation": "Test one short-lived report between two authenticated phones before broader field use."
+    },
+    {
+      "check": "Authority Source",
+      "severity": "moderate",
+      "issue": "Authenticated identity gives one response per UID, not proof of physical presence or a distinct real driver. New accounts could abuse reporting.",
+      "recommendation": "Add server-side rate limiting and App Check before public release; do not describe UID uniqueness as verified drivers."
+    },
+    {
+      "check": "Storage Abuse",
+      "severity": "moderate",
+      "issue": "Field sizes are bounded, but a user can create many report documents. Expiry hides reports without deleting stored data.",
+      "recommendation": "Add trusted per-user reporting quotas and a retention cleanup process before broader use."
+    }
+  ]
+}
